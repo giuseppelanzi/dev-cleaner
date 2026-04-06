@@ -393,8 +393,8 @@ cleanup_homebrew() {
 cleanup_cocoapods() {
     if [ -d "$HOME/.cocoapods" ]; then
         print_item "✓" "${GREEN}" "Cleaning CocoaPods cache..."
-        rm -rf ~/.cocoapods/repos/
-        rm -rf ~/Library/Caches/CocoaPods/
+        safe_rm -r ~/.cocoapods/repos/
+        safe_rm -r ~/Library/Caches/CocoaPods/
     else
         print_item "✕" "${YELLOW}" "CocoaPods not found. Skipping."
     fi
@@ -402,69 +402,69 @@ cleanup_cocoapods() {
 
 cleanup_ide_caches() {
     print_item "✓" "${GREEN}" "Cleaning general JetBrains IDE caches..."
-    rm -rf ~/Library/Caches/JetBrains/
+    safe_rm -r ~/Library/Caches/JetBrains/
     print_item "✓" "${GREEN}" "Cleaning VSCode cache..."
-    rm -rf ~/Library/Application\ Support/Code/Cache/
-    rm -rf ~/Library/Application\ Support/Code/CachedData/
-    rm -rf ~/Library/Application\ Support/Code/User/workspaceStorage/
+    safe_rm -r "$HOME/Library/Application Support/Code/Cache/"
+    safe_rm -r "$HOME/Library/Application Support/Code/CachedData/"
+    safe_rm -r "$HOME/Library/Application Support/Code/User/workspaceStorage/"
 }
 
 cleanup_system_junk() {
     print_item "✓" "${GREEN}" "Emptying the Trash..."
-    sudo rm -rf ~/.Trash/*
-    sudo rm -rf /Volumes/*/.Trashes/*
+    safe_sudo_rm -r ~/.Trash/*
+    safe_sudo_rm -r /Volumes/*/.Trashes/*
     print_item "✓" "${GREEN}" "Cleaning system-level library caches..."
-    sudo rm -rf /Library/Caches/*
+    safe_sudo_rm -r /Library/Caches/*
     print_item "✓" "${GREEN}" "Cleaning user-level log files..."
-    rm -rf ~/Library/Logs/*
+    safe_rm -r ~/Library/Logs/*
     print_item "✓" "${GREEN}" "Cleaning system-level log files..."
-    sudo rm -rf /private/var/log/*
-    sudo rm -rf /Library/Logs/*
+    safe_sudo_rm -r /private/var/log/*
+    safe_sudo_rm -r /Library/Logs/*
 }
 
 cleanup_browser_caches() {
     if [ -d "$HOME/Library/Caches/Google/Chrome" ]; then
         print_item "✓" "${GREEN}" "Cleaning Chrome cache..."
-        rm -rf ~/Library/Caches/Google/Chrome/*
+        safe_rm -r ~/Library/Caches/Google/Chrome/*
     else
         print_item "✕" "${YELLOW}" "Chrome cache not found. Skipping."
     fi
     if [ -d "$HOME/Library/Caches/BraveSoftware/Brave-Browser" ]; then
         print_item "✓" "${GREEN}" "Cleaning Brave cache..."
-        rm -rf ~/Library/Caches/BraveSoftware/Brave-Browser/*
+        safe_rm -r ~/Library/Caches/BraveSoftware/Brave-Browser/*
     else
         print_item "✕" "${YELLOW}" "Brave cache not found. Skipping."
     fi
     if [ -d "$HOME/Library/Caches/Firefox" ]; then
         print_item "✓" "${GREEN}" "Cleaning Firefox cache..."
-        rm -rf ~/Library/Caches/Firefox/*
+        safe_rm -r ~/Library/Caches/Firefox/*
     else
         print_item "✕" "${YELLOW}" "Firefox cache not found. Skipping."
     fi
     if [ -d "$HOME/Library/Caches/com.apple.Safari" ]; then
         print_item "✓" "${GREEN}" "Cleaning Safari cache..."
-        rm -rf ~/Library/Caches/com.apple.Safari/*
+        safe_rm -r ~/Library/Caches/com.apple.Safari/*
     else
         print_item "✕" "${YELLOW}" "Safari cache not found. Skipping."
     fi
     if [ -d "$HOME/Library/Caches/Microsoft Edge" ]; then
         print_item "✓" "${GREEN}" "Cleaning Microsoft Edge cache..."
-        rm -rf ~/Library/Caches/Microsoft\ Edge/*
+        safe_rm -r "$HOME/Library/Caches/Microsoft Edge/"*
     elif [ -d "$HOME/Library/Caches/com.microsoft.edgemac" ]; then
         print_item "✓" "${GREEN}" "Cleaning Microsoft Edge cache..."
-        rm -rf ~/Library/Caches/com.microsoft.edgemac/*
+        safe_rm -r ~/Library/Caches/com.microsoft.edgemac/*
     else
         print_item "✕" "${YELLOW}" "Microsoft Edge cache not found. Skipping."
     fi
     if [ -d "$HOME/Library/Caches/com.operasoftware.Opera" ]; then
         print_item "✓" "${GREEN}" "Cleaning Opera cache..."
-        rm -rf ~/Library/Caches/com.operasoftware.Opera/*
+        safe_rm -r ~/Library/Caches/com.operasoftware.Opera/*
     else
         print_item "✕" "${YELLOW}" "Opera cache not found. Skipping."
     fi
     if [ -d "$HOME/Library/Caches/com.operasoftware.OperaGX" ]; then
         print_item "✓" "${GREEN}" "Cleaning Opera GX cache..."
-        rm -rf ~/Library/Caches/com.operasoftware.OperaGX/*
+        safe_rm -r ~/Library/Caches/com.operasoftware.OperaGX/*
     fi
 }
 
@@ -474,35 +474,35 @@ cleanup_app_containers() {
     # Slack
     if [ -d "$HOME/Library/Containers/com.tinyspeck.slackmacgap" ]; then
         print_item "✓" "${GREEN}" "Cleaning Slack cache..."
-        rm -rf ~/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Caches/* 2>/dev/null || true
+        safe_rm -r ~/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Caches/*
     fi
 
     # Microsoft Teams
     if [ -d "$HOME/Library/Containers/com.microsoft.teams2" ]; then
         print_item "✓" "${GREEN}" "Cleaning Microsoft Teams cache..."
-        rm -rf ~/Library/Containers/com.microsoft.teams2/Data/Library/Caches/* 2>/dev/null || true
+        safe_rm -r ~/Library/Containers/com.microsoft.teams2/Data/Library/Caches/*
     fi
 
     # WhatsApp
     if [ -d "$HOME/Library/Containers/net.whatsapp.WhatsApp" ]; then
         print_item "✓" "${GREEN}" "Cleaning WhatsApp cache..."
-        rm -rf ~/Library/Containers/net.whatsapp.WhatsApp/Data/Library/Caches/* 2>/dev/null || true
+        safe_rm -r ~/Library/Containers/net.whatsapp.WhatsApp/Data/Library/Caches/*
     fi
 
     # Discord
     if [ -d "$HOME/Library/Application Support/discord" ]; then
         print_item "✓" "${GREEN}" "Cleaning Discord cache..."
-        rm -rf ~/Library/Application\ Support/discord/Cache/* 2>/dev/null || true
-        rm -rf ~/Library/Application\ Support/discord/Code\ Cache/* 2>/dev/null || true
+        safe_rm -r "$HOME/Library/Application Support/discord/Cache/"*
+        safe_rm -r "$HOME/Library/Application Support/discord/Code Cache/"*
     fi
 
     # Spotify
     if [ -d "$HOME/Library/Caches/com.spotify.client" ]; then
         print_item "✓" "${GREEN}" "Cleaning Spotify cache..."
-        rm -rf ~/Library/Caches/com.spotify.client/* 2>/dev/null || true
+        safe_rm -r ~/Library/Caches/com.spotify.client/*
     fi
     if [ -d "$HOME/Library/Application Support/Spotify/PersistentCache" ]; then
-        rm -rf ~/Library/Application\ Support/Spotify/PersistentCache/* 2>/dev/null || true
+        safe_rm -r "$HOME/Library/Application Support/Spotify/PersistentCache/"*
     fi
 }
 
@@ -515,8 +515,12 @@ cleanup_timemachine_snapshots() {
         if [[ "$snapshot" == *"com.apple.TimeMachine"* ]]; then
             local snapshot_date=$(echo "$snapshot" | grep -o '[0-9-]*$')
             if [ -n "$snapshot_date" ]; then
-                print_item "✓" "${GREEN}" "Deleting snapshot: $snapshot_date"
-                sudo tmutil deletelocalsnapshots "$snapshot_date" 2>/dev/null || true
+                if $DRY_RUN; then
+                    echo -e "${YELLOW}[DRY-RUN] Would delete Time Machine snapshot: $snapshot_date${NC}"
+                else
+                    print_item "✓" "${GREEN}" "Deleting snapshot: $snapshot_date"
+                    sudo tmutil deletelocalsnapshots "$snapshot_date" 2>/dev/null || true
+                fi
                 snapshot_count=$((snapshot_count + 1))
             fi
         fi
