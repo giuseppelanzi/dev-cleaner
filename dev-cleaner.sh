@@ -611,6 +611,16 @@ cleanup_cordova() {
     fi
 }
 
+cleanup_electron() {
+    if [ -d "$HOME/Library/Caches/electron" ]; then
+        print_item "✓" "${GREEN}" "Cleaning Electron cache..."
+        # Cached prebuilt binaries; wipe contents, keep the dir electron expects
+        safe_rm -rf ~/Library/Caches/electron/*
+    else
+        print_item "✕" "${YELLOW}" "Electron not found. Skipping."
+    fi
+}
+
 # --- Reclaimable-space estimation ---
 # Read-only feature: computes the current on-disk size of what every cleanup
 # option would remove, then display_menu() shows it next to each entry.
@@ -772,6 +782,11 @@ estimate_all() {
     set_estimate cordova "$(human_kb "$kb")"
     total=$((total + kb))
 
+    print_item "•" "${FAINT}" "Measuring Electron cache..."
+    kb=$(du_kb_sum "$HOME/Library/Caches/electron"/*)
+    set_estimate electron "$(human_kb "$kb")"
+    total=$((total + kb))
+
     print_item "•" "${FAINT}" "Measuring app container caches..."
     kb=$(du_kb_sum \
         "$HOME/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Caches"/* \
@@ -820,12 +835,13 @@ display_menu() {
     echo -e "${GREEN}11.${NC} Clear PlatformIO Caches$(est platformio)"
     echo -e "${GREEN}12.${NC} Clean Android SDK (old build-tools, x86 images)$(est android_sdk)"
     echo -e "${GREEN}13.${NC} Clear Cordova tmp files$(est cordova)"
-    echo -e "${GREEN}14.${NC} Clean App Containers (Slack, Teams, Discord, Spotify, WhatsApp)$(est appcontainers)"
-    echo -e "${GREEN}15.${NC} Remove Time Machine Local Snapshots (requires sudo)$(est timemachine)"
+    echo -e "${GREEN}14.${NC} Clear Electron cache$(est electron)"
+    echo -e "${GREEN}15.${NC} Clean App Containers (Slack, Teams, Discord, Spotify, WhatsApp)$(est appcontainers)"
+    echo -e "${GREEN}16.${NC} Remove Time Machine Local Snapshots (requires sudo)$(est timemachine)"
     echo ""
     echo -e "${CYAN}99.${NC} Estimate reclaimable space ${FAINT}(read-only, ~ = approximate)${NC}"
     echo ""
-    echo -e "→ Please enter your choice (0-15, or 99 to estimate): ${NC}\c"
+    echo -e "→ Please enter your choice (0-16, or 99 to estimate): ${NC}\c"
 }
 
 # --- Help function ---
@@ -899,6 +915,7 @@ main_loop() {
                 cleanup_system_junk
                 cleanup_browser_caches
                 cleanup_cordova
+                cleanup_electron
                 cleanup_app_containers
                 cleanup_timemachine_snapshots
                 ;;
@@ -992,10 +1009,14 @@ main_loop() {
                 cleanup_cordova
                 ;;
             14)
+                print_section_header "Performing Electron Cleanup"
+                cleanup_electron
+                ;;
+            15)
                 print_section_header "Performing App Containers Cleanup"
                 cleanup_app_containers
                 ;;
-            15)
+            16)
                 print_section_header "Performing Time Machine Snapshots Cleanup"
                 cleanup_timemachine_snapshots
                 ;;
@@ -1007,7 +1028,7 @@ main_loop() {
                 continue
                 ;;
             *)
-                echo -e "${RED}Invalid choice. Please enter a number between 0 and 15.${NC}"
+                echo -e "${RED}Invalid choice. Please enter a number between 0 and 16.${NC}"
                 sleep 2
                 ;;
         esac
