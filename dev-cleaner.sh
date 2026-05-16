@@ -621,6 +621,32 @@ cleanup_electron() {
     fi
 }
 
+cleanup_docker() {
+    if ! command -v docker &> /dev/null; then
+        print_item "✕" "${YELLOW}" "Docker not found. Skipping."
+        return
+    fi
+    # `command -v` only proves the CLI exists; the daemon may still be down.
+    local df_out
+    if ! df_out=$(docker system df 2>/dev/null); then
+        print_item "✕" "${YELLOW}" "Docker daemon not running. Skipping."
+        return
+    fi
+    print_item "✓" "${GREEN}" "Docker disk usage:"
+    echo "$df_out"
+    # Docker has no real --dry-run, so honour the flag manually like
+    # cleanup_android_sdk: prune is destructive (but rebuildable from
+    # Dockerfiles), so just announce it under --dry-run instead of running.
+    if $DRY_RUN; then
+        echo -e "${YELLOW}[DRY-RUN] Would run: docker system prune -f${NC}"
+    else
+        # -f skips docker's own confirmation (the script already confirmed).
+        # --volumes is intentionally omitted: it would delete named-volume
+        # data (e.g. databases), which is out of scope for a cache cleaner.
+        docker system prune -f
+    fi
+}
+
 # --- Reclaimable-space estimation ---
 # Read-only feature: computes the current on-disk size of what every cleanup
 # option would remove, then display_menu() shows it next to each entry.
@@ -787,6 +813,24 @@ estimate_all() {
     set_estimate electron "$(human_kb "$kb")"
     total=$((total + kb))
 
+    # Docker is not path-based: ask docker itself (read-only `system df`).
+    # docker-reported reclaimable for images + build cache (what `prune -f`
+    # targets, volumes excluded); approximate, so not added to the byte total.
+    print_item "•" "${FAINT}" "Measuring Docker reclaimable space..."
+    local df_fmt
+    if command -v docker &> /dev/null \
+        && df_fmt=$(docker system df --format '{{.Type}}|{{.Reclaimable}}' 2>/dev/null) \
+        && [ -n "$df_fmt" ]; then
+        local img_r cache_r
+        img_r=$(echo "$df_fmt" | awk -F'|' '$1=="Images"{sub(/ *\(.*/,"",$2);print $2}')
+        cache_r=$(echo "$df_fmt" | awk -F'|' '$1=="Build Cache"{sub(/ *\(.*/,"",$2);print $2}')
+        set_estimate docker "~${img_r:-0B} img + ${cache_r:-0B} cache"
+    elif command -v docker &> /dev/null; then
+        set_estimate docker "n/a (daemon not running)"
+    else
+        set_estimate docker "n/a (docker not found)"
+    fi
+
     print_item "•" "${FAINT}" "Measuring app container caches..."
     kb=$(du_kb_sum \
         "$HOME/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Caches"/* \
@@ -836,12 +880,13 @@ display_menu() {
     echo -e "${GREEN}12.${NC} Clean Android SDK (old build-tools, x86 images)$(est android_sdk)"
     echo -e "${GREEN}13.${NC} Clear Cordova tmp files$(est cordova)"
     echo -e "${GREEN}14.${NC} Clear Electron cache$(est electron)"
-    echo -e "${GREEN}15.${NC} Clean App Containers (Slack, Teams, Discord, Spotify, WhatsApp)$(est appcontainers)"
-    echo -e "${GREEN}16.${NC} Remove Time Machine Local Snapshots (requires sudo)$(est timemachine)"
+    echo -e "${GREEN}15.${NC} Clear Docker (prune: stopped containers, dangling images, build cache)$(est docker)"
+    echo -e "${GREEN}16.${NC} Clean App Containers (Slack, Teams, Discord, Spotify, WhatsApp)$(est appcontainers)"
+    echo -e "${GREEN}17.${NC} Remove Time Machine Local Snapshots (requires sudo)$(est timemachine)"
     echo ""
     echo -e "${CYAN}99.${NC} Estimate reclaimable space ${FAINT}(read-only, ~ = approximate)${NC}"
     echo ""
-    echo -e "→ Please enter your choice (0-16, or 99 to estimate): ${NC}\c"
+    echo -e "→ Please enter your choice (0-17, or 99 to estimate): ${NC}\c"
 }
 
 # --- Help function ---
@@ -916,6 +961,7 @@ main_loop() {
                 cleanup_browser_caches
                 cleanup_cordova
                 cleanup_electron
+                cleanup_docker
                 cleanup_app_containers
                 cleanup_timemachine_snapshots
                 ;;
@@ -1013,10 +1059,14 @@ main_loop() {
                 cleanup_electron
                 ;;
             15)
+                print_section_header "Performing Docker Cleanup"
+                cleanup_docker
+                ;;
+            16)
                 print_section_header "Performing App Containers Cleanup"
                 cleanup_app_containers
                 ;;
-            16)
+            17)
                 print_section_header "Performing Time Machine Snapshots Cleanup"
                 cleanup_timemachine_snapshots
                 ;;
@@ -1028,7 +1078,7 @@ main_loop() {
                 continue
                 ;;
             *)
-                echo -e "${RED}Invalid choice. Please enter a number between 0 and 16.${NC}"
+                echo -e "${RED}Invalid choice. Please enter a number between 0 and 17.${NC}"
                 sleep 2
                 ;;
         esac
