@@ -87,6 +87,74 @@ get_disk_space() {
     df -h . | awk 'NR==2 {print $4}'
 }
 
+# --- Estimation helpers (read-only: never delete anything) ---
+
+# Format a size given in KB into a human-readable string using the same
+# binary units as `df -h` on macOS (Gi/Mi/Ki), so the estimate matches the
+# "Free Space" figure shown at the top of the menu.
+human_kb() {
+    awk -v kb="${1:-0}" 'BEGIN {
+        if (kb >= 1048576)      printf "%.1fGi", kb / 1048576;
+        else if (kb >= 1024)    printf "%.1fMi", kb / 1024;
+        else                    printf "%dKi", kb;
+    }'
+}
+
+# Sum the disk usage (in KB) of the given paths/globs. Read-only.
+# Glob handling mirrors safe_rm() so the estimate matches what cleanup deletes.
+# Usage: du_kb_sum <path-or-glob> [<path-or-glob> ...]
+du_kb_sum() {
+    local total=0 path expanded_path kb
+    local expanded_paths=()
+    for path in "$@"; do
+        expanded_paths=()
+        shopt -s nullglob
+        if [[ "$path" == *\** || "$path" == *\?* ]]; then
+            # Intentional glob expansion (same pattern as safe_rm)
+            # shellcheck disable=SC2206
+            expanded_paths=($path)
+        else
+            expanded_paths=("$path")
+        fi
+        shopt -u nullglob
+
+        for expanded_path in "${expanded_paths[@]}"; do
+            if [[ -e "$expanded_path" ]]; then
+                kb=$(du -sk "$expanded_path" 2>/dev/null | awk '{print $1}')
+                [[ -n "$kb" ]] && total=$((total + kb))
+            fi
+        done
+    done
+    echo "$total"
+}
+
+# Same as du_kb_sum but for paths that require elevated privileges.
+# The sudo session is already kept alive by main_loop(), so no extra prompt.
+sudo_du_kb_sum() {
+    local total=0 path expanded_path kb
+    local expanded_paths=()
+    for path in "$@"; do
+        expanded_paths=()
+        shopt -s nullglob
+        if [[ "$path" == *\** || "$path" == *\?* ]]; then
+            # Intentional glob expansion (same pattern as safe_sudo_rm)
+            # shellcheck disable=SC2206
+            expanded_paths=($path)
+        else
+            expanded_paths=("$path")
+        fi
+        shopt -u nullglob
+
+        for expanded_path in "${expanded_paths[@]}"; do
+            if [[ -e "$expanded_path" ]] || sudo test -e "$expanded_path" 2>/dev/null; then
+                kb=$(sudo du -sk "$expanded_path" 2>/dev/null | awk '{print $1}')
+                [[ -n "$kb" ]] && total=$((total + kb))
+            fi
+        done
+    done
+    echo "$total"
+}
+
 # Dry-run aware file/directory removal
 # Usage: safe_rm [-r] <path> [<path> ...]
 safe_rm() {
@@ -529,6 +597,186 @@ cleanup_timemachine_snapshots() {
     fi
 }
 
+# --- Reclaimable-space estimation ---
+# Read-only feature: computes the current on-disk size of what every cleanup
+# option would remove, then display_menu() shows it next to each entry.
+# Categories use STABLE string keys (not menu numbers) so the estimate keeps
+# working when the menu is renumbered by later PRs.
+# IMPORTANT: keep these path lists in sync with the cleanup_* functions above.
+# Any new cleanup routine must add its own category to estimate_all() and a
+# matching $(est <key>) in display_menu().
+
+ESTIMATES_READY=false
+
+# Store a formatted estimate label under a stable category key.
+set_estimate() {
+    printf -v "EST_${1}_LABEL" '%s' "$2"
+}
+
+# Echo " (Estimate: <label>)" for a category key, or nothing if not computed.
+est() {
+    [ "$ESTIMATES_READY" = "true" ] || return 0
+    local varname="EST_${1}_LABEL"
+    local label="${!varname}"
+    [ -n "$label" ] || return 0
+    printf ' %s(Estimate: %s)%s' "$FAINT" "$label" "$NC"
+}
+
+estimate_all() {
+    print_item "🔍" "${CYAN}" "Calculating estimates... (this can take a while)"
+
+    local kb total=0
+
+    print_item "•" "${FAINT}" "Measuring Xcode caches..."
+    kb=$(du_kb_sum \
+        "$HOME/Library/Developer/Xcode/DerivedData" \
+        "$HOME/Library/Developer/CoreSimulator/Devices" \
+        "$HOME/Library/Developer/Xcode/iOS DeviceSupport" \
+        "$HOME/Library/Caches/com.apple.dt.Xcode" \
+        "$HOME/Library/Developer/Xcode/Archives" \
+        "$HOME/Library/Developer/Xcode/Products" \
+        "$HOME/Library/Developer/Xcode/DocumentationCache" \
+        "$HOME/Library/Containers/com.apple.CoreDevice.CoreDeviceService/Data/Library/Caches"/*)
+    set_estimate xcode "$(human_kb "$kb")"
+    total=$((total + kb))
+
+    print_item "•" "${FAINT}" "Measuring Android/Gradle caches..."
+    kb=$(du_kb_sum \
+        "$HOME/.gradle/caches" \
+        "$HOME/.gradle/daemon" \
+        "$HOME/Library/Caches/Google"/AndroidStudio* \
+        "$HOME/Library/Caches/JetBrains"/AndroidStudio*)
+    set_estimate android "$(human_kb "$kb")"
+    total=$((total + kb))
+
+    print_item "•" "${FAINT}" "Measuring Android SDK..."
+    local sdk_kb=0 d
+    if [ -d "$HOME/Library/Android/sdk/build-tools" ]; then
+        # Mirrors cleanup_android_sdk: keep latest 2 build-tools by mtime.
+        # SDK version dir names are plain (e.g. 34.0.0), ls -t is safe here.
+        # shellcheck disable=SC2012
+        while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            sdk_kb=$((sdk_kb + $(du_kb_sum "$HOME/Library/Android/sdk/build-tools/$d")))
+        done < <(cd "$HOME/Library/Android/sdk/build-tools" 2>/dev/null && ls -t | tail -n +3)
+    fi
+    sdk_kb=$((sdk_kb + $(du_kb_sum "$HOME/Library/Android/sdk/.temp")))
+    if [ "$(uname -m)" = "arm64" ]; then
+        while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            sdk_kb=$((sdk_kb + $(du_kb_sum "$d")))
+        done < <(find "$HOME/Library/Android/sdk/system-images" -type d -name "x86" 2>/dev/null)
+    fi
+    set_estimate android_sdk "$(human_kb "$sdk_kb")"
+    total=$((total + sdk_kb))
+
+    print_item "•" "${FAINT}" "Measuring Flutter global cache..."
+    local flutter_kb froot
+    flutter_kb=$(du_kb_sum "$HOME/.pub-cache")
+    if command -v flutter >/dev/null 2>&1; then
+        froot="$(cd "$(dirname "$(command -v flutter)")" 2>/dev/null && pwd)"
+        [ -n "$froot" ] && flutter_kb=$((flutter_kb + $(du_kb_sum "$froot/cache")))
+    fi
+    set_estimate flutter "~$(human_kb "$flutter_kb")"
+    total=$((total + flutter_kb))
+
+    print_item "•" "${FAINT}" "Measuring npm/Yarn/pnpm caches..."
+    local npm_kb npm_cache yarn_dir pnpm_dir
+    npm_cache=""
+    command -v npm >/dev/null 2>&1 && npm_cache="$(npm config get cache 2>/dev/null)"
+    case "$npm_cache" in ""|undefined|null) npm_cache="$HOME/.npm" ;; esac
+    npm_kb=$(du_kb_sum "$npm_cache/_cacache")
+    if command -v yarn >/dev/null 2>&1; then
+        yarn_dir="$(yarn cache dir 2>/dev/null)"
+        [ -n "$yarn_dir" ] && npm_kb=$((npm_kb + $(du_kb_sum "$yarn_dir")))
+    fi
+    if command -v pnpm >/dev/null 2>&1; then
+        pnpm_dir="$(pnpm store path 2>/dev/null)"
+        [ -n "$pnpm_dir" ] && npm_kb=$((npm_kb + $(du_kb_sum "$pnpm_dir")))
+    fi
+    set_estimate npm "~$(human_kb "$npm_kb")"
+    total=$((total + npm_kb))
+
+    print_item "•" "${FAINT}" "Measuring Homebrew cache..."
+    local brew_kb=0 brew_cache
+    if command -v brew >/dev/null 2>&1; then
+        brew_cache="$(brew --cache 2>/dev/null)"
+        [ -n "$brew_cache" ] && brew_kb=$(du_kb_sum "$brew_cache")
+    fi
+    set_estimate homebrew "~$(human_kb "$brew_kb")"
+    total=$((total + brew_kb))
+
+    print_item "•" "${FAINT}" "Measuring CocoaPods cache..."
+    kb=$(du_kb_sum \
+        "$HOME/.cocoapods/repos" \
+        "$HOME/Library/Caches/CocoaPods")
+    set_estimate cocoapods "$(human_kb "$kb")"
+    total=$((total + kb))
+
+    print_item "•" "${FAINT}" "Measuring IDE caches..."
+    kb=$(du_kb_sum \
+        "$HOME/Library/Caches/JetBrains" \
+        "$HOME/Library/Application Support/Code/Cache" \
+        "$HOME/Library/Application Support/Code/CachedData" \
+        "$HOME/Library/Application Support/Code/User/workspaceStorage")
+    set_estimate ide "$(human_kb "$kb")"
+    total=$((total + kb))
+
+    print_item "•" "${FAINT}" "Measuring system junk & logs (sudo)..."
+    local system_kb
+    system_kb=$(sudo_du_kb_sum \
+        "$HOME/.Trash"/* \
+        /Volumes/*/.Trashes/* \
+        /Library/Caches/* \
+        "$HOME/Library/Logs"/* \
+        /private/var/log/* \
+        /Library/Logs/*)
+    set_estimate system "~$(human_kb "$system_kb")"
+    total=$((total + system_kb))
+
+    print_item "•" "${FAINT}" "Measuring browser caches..."
+    kb=$(du_kb_sum \
+        "$HOME/Library/Caches/Google/Chrome"/* \
+        "$HOME/Library/Caches/BraveSoftware/Brave-Browser"/* \
+        "$HOME/Library/Caches/Firefox"/* \
+        "$HOME/Library/Caches/com.apple.Safari"/* \
+        "$HOME/Library/Caches/Microsoft Edge"/* \
+        "$HOME/Library/Caches/com.microsoft.edgemac"/* \
+        "$HOME/Library/Caches/com.operasoftware.Opera"/* \
+        "$HOME/Library/Caches/com.operasoftware.OperaGX"/*)
+    set_estimate browser "$(human_kb "$kb")"
+    total=$((total + kb))
+
+    print_item "•" "${FAINT}" "Measuring PlatformIO global cache..."
+    local pio_kb
+    pio_kb=$(du_kb_sum "$HOME/.platformio/.cache")
+    set_estimate platformio "~$(human_kb "$pio_kb")"
+    total=$((total + pio_kb))
+
+    print_item "•" "${FAINT}" "Measuring app container caches..."
+    kb=$(du_kb_sum \
+        "$HOME/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Caches"/* \
+        "$HOME/Library/Containers/com.microsoft.teams2/Data/Library/Caches"/* \
+        "$HOME/Library/Containers/net.whatsapp.WhatsApp/Data/Library/Caches"/* \
+        "$HOME/Library/Application Support/discord/Cache"/* \
+        "$HOME/Library/Application Support/discord/Code Cache"/* \
+        "$HOME/Library/Caches/com.spotify.client"/* \
+        "$HOME/Library/Application Support/Spotify/PersistentCache"/*)
+    set_estimate appcontainers "$(human_kb "$kb")"
+    total=$((total + kb))
+
+    print_item "•" "${FAINT}" "Counting Time Machine local snapshots..."
+    local tm_count
+    tm_count=$(sudo tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple.TimeMachine')
+    [ -n "$tm_count" ] || tm_count=0
+    set_estimate timemachine "${tm_count} snapshot(s)"
+
+    set_estimate total "~$(human_kb "$total")"
+    ESTIMATES_READY=true
+
+    print_item "✓" "${GREEN}" "Estimates ready. ~ marks approximate values."
+}
+
 # --- Main Display Function ---
 display_menu() {
     clear
@@ -540,22 +788,24 @@ display_menu() {
     echo ""
     print_section_header "Available Options:"
     echo -e "${RED} 0.${NC} ${BOLD}Exit Program${NC}"
-    echo -e "${GREEN} 1.${NC} Clear All Caches"
-    echo -e "${GREEN} 2.${NC} Clear Xcode Caches & DerivedData"
-    echo -e "${GREEN} 3.${NC} Clear Android/Gradle Caches"
-    echo -e "${GREEN} 4.${NC} Clear Flutter Caches ${FAINT}(with custom directory option)${NC}"
-    echo -e "${GREEN} 5.${NC} Clear npm/Yarn/pnpm Caches"
-    echo -e "${GREEN} 6.${NC} Clean Homebrew Caches"
-    echo -e "${GREEN} 7.${NC} Clear CocoaPods Caches"
-    echo -e "${GREEN} 8.${NC} Clear IDE (JetBrains, VSCode) Caches"
-    echo -e "${GREEN} 9.${NC} Clean System Junk & Logs (requires sudo)"
-    echo -e "${GREEN}10.${NC} Clear Browser Caches (Chrome, Brave, Firefox, Safari, Edge, Opera)"
-    echo -e "${GREEN}11.${NC} Clear PlatformIO Caches"
-    echo -e "${GREEN}12.${NC} Clean Android SDK (old build-tools, x86 images)"
-    echo -e "${GREEN}13.${NC} Clean App Containers (Slack, Teams, Discord, Spotify, WhatsApp)"
-    echo -e "${GREEN}14.${NC} Remove Time Machine Local Snapshots (requires sudo)"
+    echo -e "${GREEN} 1.${NC} Clear All Caches$(est total)"
+    echo -e "${GREEN} 2.${NC} Clear Xcode Caches & DerivedData$(est xcode)"
+    echo -e "${GREEN} 3.${NC} Clear Android/Gradle Caches$(est android)"
+    echo -e "${GREEN} 4.${NC} Clear Flutter Caches ${FAINT}(with custom directory option)${NC}$(est flutter)"
+    echo -e "${GREEN} 5.${NC} Clear npm/Yarn/pnpm Caches$(est npm)"
+    echo -e "${GREEN} 6.${NC} Clean Homebrew Caches$(est homebrew)"
+    echo -e "${GREEN} 7.${NC} Clear CocoaPods Caches$(est cocoapods)"
+    echo -e "${GREEN} 8.${NC} Clear IDE (JetBrains, VSCode) Caches$(est ide)"
+    echo -e "${GREEN} 9.${NC} Clean System Junk & Logs (requires sudo)$(est system)"
+    echo -e "${GREEN}10.${NC} Clear Browser Caches (Chrome, Brave, Firefox, Safari, Edge, Opera)$(est browser)"
+    echo -e "${GREEN}11.${NC} Clear PlatformIO Caches$(est platformio)"
+    echo -e "${GREEN}12.${NC} Clean Android SDK (old build-tools, x86 images)$(est android_sdk)"
+    echo -e "${GREEN}13.${NC} Clean App Containers (Slack, Teams, Discord, Spotify, WhatsApp)$(est appcontainers)"
+    echo -e "${GREEN}14.${NC} Remove Time Machine Local Snapshots (requires sudo)$(est timemachine)"
     echo ""
-    echo -e "→ Please enter your choice (0-14): ${NC}\c"
+    echo -e "${CYAN}99.${NC} Estimate reclaimable space ${FAINT}(read-only, ~ = approximate)${NC}"
+    echo ""
+    echo -e "→ Please enter your choice (0-14, or 99 to estimate): ${NC}\c"
 }
 
 # --- Help function ---
@@ -576,6 +826,12 @@ Options:
 Command-line Flutter cleanup:
   You can specify a custom directory for Flutter cleanup using the --flutter-dir option.
   This directory will be used when running the interactive menu or the "Clear All" option.
+
+Interactive menu:
+  Option 99 estimates the reclaimable space for every entry and redraws the
+  menu with "(Estimate: <size>)". It is read-only (only runs 'du', deletes
+  nothing) and works in --dry-run too. A leading "~" marks an approximate
+  value; Flutter and PlatformIO estimates cover the global cache only.
 
 Examples:
   $0                                    # Run interactive menu (searches current directory for Flutter projects)
@@ -717,6 +973,13 @@ main_loop() {
             14)
                 print_section_header "Performing Time Machine Snapshots Cleanup"
                 cleanup_timemachine_snapshots
+                ;;
+            99)
+                print_section_header "Estimating Reclaimable Space"
+                estimate_all
+                # Read-only: skip the before/after summary and redraw the menu
+                # with the freshly computed estimates.
+                continue
                 ;;
             *)
                 echo -e "${RED}Invalid choice. Please enter a number between 0 and 14.${NC}"
