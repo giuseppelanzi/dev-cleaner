@@ -20,6 +20,10 @@ $GITHUB_REPO = "https://github.com/jemishavasoya/dev-cleaner"
 # --- Error Tracking ---
 $script:FailedItems = [System.Collections.ArrayList]::new()
 
+# --- Estimation state ---
+$script:Estimates = @{}
+$script:EstimatesReady = $false
+
 # --- Helper Functions ---
 
 function Show-Logo {
@@ -67,6 +71,53 @@ function Get-DiskSpace {
         return "$freeGB GB"
     }
     return "Unknown"
+}
+
+# --- Estimation helpers (read-only: never delete anything) ---
+
+function Get-PathSizeBytes {
+    param([string[]]$Paths)
+    [int64]$total = 0
+    foreach ($pattern in $Paths) {
+        if ([string]::IsNullOrWhiteSpace($pattern)) { continue }
+        $items = Get-Item -Path $pattern -Force -ErrorAction SilentlyContinue
+        foreach ($item in $items) {
+            try {
+                if ($item.PSIsContainer) {
+                    $sum = (Get-ChildItem -LiteralPath $item.FullName -Recurse -Force -File -ErrorAction SilentlyContinue |
+                            Measure-Object -Property Length -Sum).Sum
+                    if ($sum) { $total += [int64]$sum }
+                } else {
+                    $total += [int64]$item.Length
+                }
+            } catch { }
+        }
+    }
+    return $total
+}
+
+function Format-Size {
+    param([int64]$Bytes)
+    if ($Bytes -ge 1GB)     { return ("{0:N1} GB" -f ($Bytes / 1GB)) }
+    elseif ($Bytes -ge 1MB) { return ("{0:N1} MB" -f ($Bytes / 1MB)) }
+    elseif ($Bytes -ge 1KB) { return ("{0:N0} KB" -f ($Bytes / 1KB)) }
+    else                    { return ("{0} B" -f $Bytes) }
+}
+
+function Set-Estimate {
+    param([string]$Key, [string]$Label)
+    $script:Estimates[$Key] = $Label
+}
+
+# Returns " (Estimate: <label>)" for a stable category key, or "" if not yet
+# computed. Keys are strings (not menu numbers) so renumbering stays safe.
+function Get-Est {
+    param([string]$Key)
+    if (-not $script:EstimatesReady) { return "" }
+    if ($script:Estimates.ContainsKey($Key) -and $script:Estimates[$Key]) {
+        return " (Estimate: $($script:Estimates[$Key]))"
+    }
+    return ""
 }
 
 # --- Admin Elevation Functions ---
@@ -543,6 +594,170 @@ function Clear-AppContainers {
     }
 }
 
+# --- Reclaimable-space estimation ---
+# Read-only: computes the current on-disk size of what each cleanup option
+# would remove, then Show-Menu shows it next to each entry. Categories use
+# stable string keys so the menu can be renumbered safely.
+# IMPORTANT: keep these path lists in sync with the Clear-* functions above.
+
+function Invoke-EstimateAll {
+    Write-Item "🔍" "Cyan" "Calculating estimates... (this can take a while)"
+    [int64]$total = 0
+    [int64]$b = 0
+
+    # Visual Studio - global caches only (~); project bin/obj/.vs not scanned
+    Write-Host "  Measuring Visual Studio caches..." -ForegroundColor DarkGray
+    $vsPaths = @()
+    $vsVersions = Get-ChildItem -Path "$env:LOCALAPPDATA\Microsoft\VisualStudio" -Directory -ErrorAction SilentlyContinue
+    foreach ($v in $vsVersions) {
+        $vsPaths += "$($v.FullName)\ComponentModelCache"
+        $vsPaths += "$($v.FullName)\MEFCacheData"
+        $vsPaths += "$($v.FullName)\Designer\ShadowCache"
+        $vsPaths += "$($v.FullName)\ImageLibrary"
+    }
+    $b = Get-PathSizeBytes $vsPaths
+    Set-Estimate "visualstudio" ("~" + (Format-Size $b)); $total += $b
+
+    # Android / Gradle
+    Write-Host "  Measuring Android/Gradle caches..." -ForegroundColor DarkGray
+    $b = Get-PathSizeBytes @(
+        "$env:USERPROFILE\.gradle\caches",
+        "$env:USERPROFILE\.gradle\daemon",
+        "$env:LOCALAPPDATA\Google\AndroidStudio*",
+        "$env:LOCALAPPDATA\JetBrains\AndroidStudio*"
+    )
+    Set-Estimate "android" (Format-Size $b); $total += $b
+
+    # Android SDK - old build-tools (keep latest 2) + .temp
+    Write-Host "  Measuring Android SDK..." -ForegroundColor DarkGray
+    $sdkPath = "$env:LOCALAPPDATA\Android\Sdk"
+    $sdkPaths = @("$sdkPath\.temp")
+    $btPath = "$sdkPath\build-tools"
+    if (Test-Path $btPath) {
+        $old = Get-ChildItem -Path $btPath -Directory -ErrorAction SilentlyContinue |
+               Sort-Object Name -Descending | Select-Object -Skip 2
+        foreach ($o in $old) { $sdkPaths += $o.FullName }
+    }
+    $b = Get-PathSizeBytes $sdkPaths
+    Set-Estimate "androidsdk" (Format-Size $b); $total += $b
+
+    # Flutter - global cache only (~)
+    Write-Host "  Measuring Flutter global cache..." -ForegroundColor DarkGray
+    $flPaths = @("$env:LOCALAPPDATA\Pub\Cache", "$env:APPDATA\Pub\Cache")
+    $fcmd = Get-Command flutter -ErrorAction SilentlyContinue
+    if ($fcmd) {
+        $fbin = Split-Path $fcmd.Source -Parent
+        if ($fbin) { $flPaths += (Join-Path $fbin "cache") }
+    }
+    $b = Get-PathSizeBytes $flPaths
+    Set-Estimate "flutter" ("~" + (Format-Size $b)); $total += $b
+
+    # npm / Yarn / pnpm (~)
+    Write-Host "  Measuring npm/Yarn/pnpm caches..." -ForegroundColor DarkGray
+    $npmPaths = @("$env:LOCALAPPDATA\pnpm\store", "$env:LOCALAPPDATA\pnpm-cache")
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+        $nc = (npm config get cache 2>$null | Select-Object -First 1)
+        if ($nc) { $nc = "$nc".Trim() }
+        if ($nc -and $nc -ne "undefined" -and $nc -ne "null") { $npmPaths += (Join-Path $nc "_cacache") }
+    }
+    if (Get-Command yarn -ErrorAction SilentlyContinue) {
+        $yd = (yarn cache dir 2>$null | Select-Object -First 1)
+        if ($yd) { $npmPaths += "$yd".Trim() }
+    }
+    if (Get-Command pnpm -ErrorAction SilentlyContinue) {
+        $pd = (pnpm store path 2>$null | Select-Object -First 1)
+        if ($pd) { $npmPaths += "$pd".Trim() }
+    }
+    $b = Get-PathSizeBytes $npmPaths
+    Set-Estimate "npm" ("~" + (Format-Size $b)); $total += $b
+
+    # NuGet
+    Write-Host "  Measuring NuGet caches..." -ForegroundColor DarkGray
+    $b = Get-PathSizeBytes @(
+        "$env:USERPROFILE\.nuget\packages",
+        "$env:LOCALAPPDATA\NuGet\v3-cache",
+        "$env:LOCALAPPDATA\NuGet\plugins-cache",
+        "$env:TEMP\NuGetScratch"
+    )
+    Set-Estimate "nuget" (Format-Size $b); $total += $b
+
+    # PlatformIO - global cache only (~)
+    Write-Host "  Measuring PlatformIO global cache..." -ForegroundColor DarkGray
+    $b = Get-PathSizeBytes @("$env:USERPROFILE\.platformio\.cache")
+    Set-Estimate "platformio" ("~" + (Format-Size $b)); $total += $b
+
+    # IDE caches (JetBrains + VSCode)
+    Write-Host "  Measuring IDE caches..." -ForegroundColor DarkGray
+    $idePaths = @(
+        "$env:APPDATA\Code\Cache",
+        "$env:APPDATA\Code\CachedData",
+        "$env:APPDATA\Code\User\workspaceStorage",
+        "$env:APPDATA\Code - Insiders\Cache",
+        "$env:APPDATA\Code - Insiders\CachedData"
+    )
+    $jb = Get-ChildItem -Path "$env:LOCALAPPDATA\JetBrains" -Directory -ErrorAction SilentlyContinue
+    foreach ($j in $jb) {
+        $idePaths += "$($j.FullName)\caches"
+        $idePaths += "$($j.FullName)\index"
+        $idePaths += "$($j.FullName)\tmp"
+    }
+    $b = Get-PathSizeBytes $idePaths
+    Set-Estimate "ide" (Format-Size $b); $total += $b
+
+    # Windows Temp (~) - Recycle Bin / admin system temp not measured
+    Write-Host "  Measuring Windows temp..." -ForegroundColor DarkGray
+    $b = Get-PathSizeBytes @("$env:TEMP", "$env:LOCALAPPDATA\Temp")
+    Set-Estimate "windowstemp" ("~" + (Format-Size $b)); $total += $b
+
+    # Browser caches
+    Write-Host "  Measuring browser caches..." -ForegroundColor DarkGray
+    $brPaths = @(
+        "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Cache",
+        "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Code Cache",
+        "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Cache",
+        "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Code Cache",
+        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data\Default\Cache",
+        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data\Default\Code Cache",
+        "$env:APPDATA\Opera Software\Opera Stable\Cache",
+        "$env:APPDATA\Opera Software\Opera GX Stable\Cache"
+    )
+    $ffProfiles = "$env:LOCALAPPDATA\Mozilla\Firefox\Profiles"
+    if (Test-Path $ffProfiles) {
+        $profs = Get-ChildItem -Path $ffProfiles -Directory -ErrorAction SilentlyContinue
+        foreach ($p in $profs) { $brPaths += "$($p.FullName)\cache2" }
+    }
+    $b = Get-PathSizeBytes $brPaths
+    Set-Estimate "browser" (Format-Size $b); $total += $b
+
+    # App containers
+    Write-Host "  Measuring app caches..." -ForegroundColor DarkGray
+    $acPaths = @(
+        "$env:APPDATA\Slack\Cache",
+        "$env:APPDATA\Slack\Service Worker\CacheStorage",
+        "$env:APPDATA\Microsoft\Teams\Cache",
+        "$env:APPDATA\Microsoft\Teams\blob_storage",
+        "$env:APPDATA\Microsoft\Teams\databases",
+        "$env:APPDATA\Microsoft\Teams\GPUCache",
+        "$env:APPDATA\Microsoft\Teams\IndexedDB",
+        "$env:APPDATA\Microsoft\Teams\Local Storage",
+        "$env:APPDATA\Microsoft\Teams\tmp",
+        "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams",
+        "$env:APPDATA\discord\Cache",
+        "$env:APPDATA\discord\Code Cache",
+        "$env:LOCALAPPDATA\Spotify\Storage",
+        "$env:APPDATA\Spotify",
+        "$env:LOCALAPPDATA\WhatsApp\Cache"
+    )
+    $waUwp = Get-ChildItem -Path "$env:LOCALAPPDATA\Packages" -Filter "*WhatsApp*" -Directory -ErrorAction SilentlyContinue
+    foreach ($w in $waUwp) { $acPaths += "$($w.FullName)\LocalCache" }
+    $b = Get-PathSizeBytes $acPaths
+    Set-Estimate "appcontainers" (Format-Size $b); $total += $b
+
+    Set-Estimate "total" ("~" + (Format-Size $total))
+    $script:EstimatesReady = $true
+    Write-Item "✓" "Green" "Estimates ready. ~ marks approximate values."
+}
+
 # --- Menu Display ---
 
 function Show-Menu {
@@ -555,24 +770,26 @@ function Show-Menu {
     Write-Host ""
     Write-SectionHeader "Available Options:"
     Write-Host " 0. Exit Program" -ForegroundColor Red
-    Write-Host " 1. Clear All Caches" -ForegroundColor Green
+    Write-Host (" 1. Clear All Caches" + (Get-Est 'total')) -ForegroundColor Green
     Write-Host "─── Development Tools ───" -ForegroundColor DarkGray
-    Write-Host " 2. Clear Visual Studio Caches (bin/obj/.vs + global)" -ForegroundColor Green
-    Write-Host " 3. Clear Android/Gradle Caches" -ForegroundColor Green
-    Write-Host " 4. Clear Android SDK (old build-tools)" -ForegroundColor Green
+    Write-Host (" 2. Clear Visual Studio Caches (bin/obj/.vs + global)" + (Get-Est 'visualstudio')) -ForegroundColor Green
+    Write-Host (" 3. Clear Android/Gradle Caches" + (Get-Est 'android')) -ForegroundColor Green
+    Write-Host (" 4. Clear Android SDK (old build-tools)" + (Get-Est 'androidsdk')) -ForegroundColor Green
     Write-Host " 5. Clear Flutter Caches " -NoNewline -ForegroundColor Green
-    Write-Host "(with custom directory option)" -ForegroundColor DarkGray
-    Write-Host " 6. Clear npm/Yarn/pnpm Caches" -ForegroundColor Green
-    Write-Host " 7. Clear NuGet Package Cache" -ForegroundColor Green
-    Write-Host " 8. Clear PlatformIO Caches" -ForegroundColor Green
+    Write-Host ("(with custom directory option)" + (Get-Est 'flutter')) -ForegroundColor DarkGray
+    Write-Host (" 6. Clear npm/Yarn/pnpm Caches" + (Get-Est 'npm')) -ForegroundColor Green
+    Write-Host (" 7. Clear NuGet Package Cache" + (Get-Est 'nuget')) -ForegroundColor Green
+    Write-Host (" 8. Clear PlatformIO Caches" + (Get-Est 'platformio')) -ForegroundColor Green
     Write-Host "─── IDEs & Editors ───" -ForegroundColor DarkGray
-    Write-Host " 9. Clear IDE Caches (JetBrains, VSCode)" -ForegroundColor Green
+    Write-Host (" 9. Clear IDE Caches (JetBrains, VSCode)" + (Get-Est 'ide')) -ForegroundColor Green
     Write-Host "─── System ───" -ForegroundColor DarkGray
-    Write-Host "10. Clean Windows Temp & Recycle Bin" -ForegroundColor Green
-    Write-Host "11. Clear Browser Caches (Chrome, Edge, Firefox, Brave, Opera)" -ForegroundColor Green
-    Write-Host "12. Clean App Caches (Slack, Teams, Discord, Spotify, WhatsApp)" -ForegroundColor Green
+    Write-Host ("10. Clean Windows Temp & Recycle Bin" + (Get-Est 'windowstemp')) -ForegroundColor Green
+    Write-Host ("11. Clear Browser Caches (Chrome, Edge, Firefox, Brave, Opera)" + (Get-Est 'browser')) -ForegroundColor Green
+    Write-Host ("12. Clean App Caches (Slack, Teams, Discord, Spotify, WhatsApp)" + (Get-Est 'appcontainers')) -ForegroundColor Green
     Write-Host ""
-    Write-Host "→ Please enter your choice (0-12): " -NoNewline
+    Write-Host "99. Estimate reclaimable space (read-only, ~ = approximate)" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "→ Please enter your choice (0-12, or 99 to estimate): " -NoNewline
 }
 
 # --- Main Loop ---
@@ -676,6 +893,13 @@ function Start-MainLoop {
                 Write-SectionHeader "Performing App Caches Cleanup"
                 Clear-AppContainers
             }
+            "99" {
+                Write-SectionHeader "Estimating Reclaimable Space"
+                Invoke-EstimateAll
+                # Read-only: skip the before/after summary and redraw the menu
+                # with the freshly computed estimates.
+                continue
+            }
             default {
                 Write-Host "Invalid choice. Please enter a number between 0 and 12." -ForegroundColor Red
                 Start-Sleep -Seconds 2
@@ -713,6 +937,12 @@ Options:
                       Example: .\dev-cleaner.ps1 -FlutterDir "C:\Projects"
   -VsDir PATH         Set custom directory for Visual Studio cleanup (default: current directory)
                       Example: .\dev-cleaner.ps1 -VsDir "C:\Projects\DotNet"
+
+Interactive menu:
+  Option 99 estimates the reclaimable space for every entry and redraws the
+  menu with "(Estimate: <size>)". It is read-only (deletes nothing). A leading
+  "~" marks an approximate value; Flutter, PlatformIO and Visual Studio
+  estimates cover the global cache only.
 
 Examples:
   .\dev-cleaner.ps1                                    # Run interactive menu
