@@ -104,6 +104,27 @@ function Format-Size {
     else                    { return ("{0} B" -f $Bytes) }
 }
 
+# Convert a Docker size string (Docker uses DECIMAL units: B/kB/MB/GB/TB,
+# e.g. "1.02GB", "728.5MB", "32.8kB", "0B") into bytes, so Docker's own
+# self-reported sizes can be summed and fed to Format-Size like every other
+# estimate. Suffix order matters: kB/MB/GB/TB all end in "B", so the bare
+# "B" case must be checked last. Docker always prints a dot as the decimal
+# separator, hence InvariantCulture. Read-only.
+function Convert-DockerSize {
+    param([string]$Size)
+    if ([string]::IsNullOrWhiteSpace($Size)) { return [int64]0 }
+    $s = $Size.Trim()
+    $ci = [System.Globalization.CultureInfo]::InvariantCulture
+    try {
+        if     ($s -match '^([\d.]+)TB$') { return [int64]([double]::Parse($Matches[1], $ci) * 1e12) }
+        elseif ($s -match '^([\d.]+)GB$') { return [int64]([double]::Parse($Matches[1], $ci) * 1e9) }
+        elseif ($s -match '^([\d.]+)MB$') { return [int64]([double]::Parse($Matches[1], $ci) * 1e6) }
+        elseif ($s -match '^([\d.]+)kB$') { return [int64]([double]::Parse($Matches[1], $ci) * 1e3) }
+        elseif ($s -match '^([\d.]+)B$')  { return [int64][double]::Parse($Matches[1], $ci) }
+    } catch { }
+    return [int64]0
+}
+
 function Set-Estimate {
     param([string]$Key, [string]$Label)
     $script:Estimates[$Key] = $Label
@@ -624,7 +645,11 @@ function Clear-Electron {
     }
 }
 
+# -Interactive offers the deeper `prune -af` via a secondary prompt. "Clear All
+# Caches" calls this without it, so a bulk run never deletes tagged images by
+# surprise.
 function Clear-Docker {
+    param([switch]$Interactive)
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         Write-Item "✕" "Yellow" "Docker not found. Skipping."
         return
@@ -637,10 +662,23 @@ function Clear-Docker {
     }
     Write-Item "✓" "Green" "Docker disk usage:"
     $dfOut | ForEach-Object { Write-Host $_ }
-    # -f skips docker's own confirmation (the script already confirmed).
-    # --volumes is intentionally omitted: it would delete named-volume data
-    # (e.g. databases), which is out of scope for a cache cleaner.
-    docker system prune -f
+
+    # `prune -f` removes stopped containers, unused networks, dangling
+    # (untagged) images and unused build cache; -f skips docker's own
+    # confirmation (the script already confirmed). `-a` additionally removes
+    # EVERY image not used by a container, including tagged ones that may only
+    # exist in a private registry — so it's opt-in via a prompt, never in the
+    # bulk "Clear All" path. (--volumes stays omitted in both: it would delete
+    # named-volume data like databases.)
+    $pruneArgs = @('-f')
+    if ($Interactive) {
+        Write-Host ""
+        Write-Host "Also remove unused but TAGGED images? Frees more space, but they" -ForegroundColor Yellow
+        Write-Host "must be re-pulled/rebuilt (e.g. private-registry images). (y/N):" -ForegroundColor Yellow
+        $ans = Read-Host
+        if ($ans -eq 'y') { $pruneArgs = @('-af') }
+    }
+    docker system prune @pruneArgs
 }
 
 # --- Reclaimable-space estimation ---
@@ -794,18 +832,45 @@ function Invoke-EstimateAll {
     $b = Get-PathSizeBytes $electronCache
     Set-Estimate "electron" (Format-Size $b); $total += $b
 
-    # Docker is not path-based: ask docker itself (read-only `system df`).
-    # docker-reported reclaimable for images + build cache (what `prune -f`
-    # targets, volumes excluded); approximate, so not added to the byte total.
+    # Docker is not path-based: ask docker itself (read-only). Two figures,
+    # because option 11 offers two prune modes:
+    #   -f  : build-cache reclaimable + dangling (untagged) images
+    #   -af : the above + ALL images not used by a container (tagged too)
+    # Build-cache reclaimable comes from the `system df` summary (Docker
+    # computes it correctly; only its Images figure is unreliable with the
+    # containerd image store). Per-image sizes come from `system df -v`,
+    # summing UNIQUE SIZE of 0-container rows so shared layers aren't double
+    # counted. Approximate, so not added to the byte total.
     Write-Host "  Measuring Docker reclaimable space..." -ForegroundColor DarkGray
     if (Get-Command docker -ErrorAction SilentlyContinue) {
         $dfFmt = docker system df --format '{{.Type}}|{{.Reclaimable}}' 2>$null
         if ($LASTEXITCODE -eq 0 -and $dfFmt) {
-            $imgR = (($dfFmt | Where-Object { $_ -like 'Images|*' }) -split '\|', 2)[1] -replace ' *\(.*', ''
-            $cacheR = (($dfFmt | Where-Object { $_ -like 'Build Cache|*' }) -split '\|', 2)[1] -replace ' *\(.*', ''
-            if (-not $imgR) { $imgR = '0B' }
-            if (-not $cacheR) { $cacheR = '0B' }
-            Set-Estimate "docker" "~$imgR img + $cacheR cache"
+            $cacheTok = (($dfFmt | Where-Object { $_ -like 'Build Cache|*' }) -split '\|', 2)[1] -replace ' *\(.*', ''
+            [int64]$cacheBytes = Convert-DockerSize $cacheTok
+            # Parse the "Images space usage:" table. CREATED is multi-word
+            # ("4 days ago"), so index columns from the RIGHT: last = CONTAINERS,
+            # second-to-last = UNIQUE SIZE. Dangling images have REPOSITORY <none>.
+            [int64]$danglingBytes = 0
+            [int64]$allUnusedBytes = 0
+            $inImages = $false
+            foreach ($line in (docker system df -v 2>$null)) {
+                if ($line -match '^Images space usage:') { $inImages = $true; continue }
+                if (-not $inImages) { continue }
+                if ($line -match '^REPOSITORY') { continue }
+                if ([string]::IsNullOrWhiteSpace($line)) { $inImages = $false; continue }
+                $cols = $line.Trim() -split '\s+'
+                if ($cols.Count -lt 3 -or $cols[-1] -ne '0') { continue }
+                $uniq = Convert-DockerSize $cols[-2]
+                $allUnusedBytes += $uniq
+                if ($cols[0] -eq '<none>') { $danglingBytes += $uniq }
+            }
+            [int64]$fBytes = $cacheBytes + $danglingBytes
+            [int64]$afBytes = $cacheBytes + $allUnusedBytes
+            if ($afBytes -gt $fBytes) {
+                Set-Estimate "docker" "~$(Format-Size $fBytes) → ~$(Format-Size $afBytes) with -a"
+            } else {
+                Set-Estimate "docker" "~$(Format-Size $fBytes)"
+            }
         } else {
             Set-Estimate "docker" "n/a (daemon not running)"
         }
@@ -866,7 +931,7 @@ function Show-Menu {
     Write-Host (" 8. Clear PlatformIO Caches" + (Get-Est 'platformio')) -ForegroundColor Green
     Write-Host (" 9. Clear Cordova tmp files" + (Get-Est 'cordova')) -ForegroundColor Green
     Write-Host ("10. Clear Electron cache" + (Get-Est 'electron')) -ForegroundColor Green
-    Write-Host ("11. Clear Docker (prune: stopped containers, dangling images, build cache)" + (Get-Est 'docker')) -ForegroundColor Green
+    Write-Host ("11. Clear Docker (prune containers, dangling images & build cache; asks before removing unused tagged images)" + (Get-Est 'docker')) -ForegroundColor Green
     Write-Host "─── IDEs & Editors ───" -ForegroundColor DarkGray
     Write-Host ("12. Clear IDE Caches (JetBrains, VSCode)" + (Get-Est 'ide')) -ForegroundColor Green
     Write-Host "─── System ───" -ForegroundColor DarkGray
@@ -977,7 +1042,7 @@ function Start-MainLoop {
             }
             "11" {
                 Write-SectionHeader "Performing Docker Cleanup"
-                Clear-Docker
+                Clear-Docker -Interactive
             }
             "12" {
                 Write-SectionHeader "Performing IDE Caches Cleanup"
