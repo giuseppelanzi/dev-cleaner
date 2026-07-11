@@ -594,6 +594,21 @@ function Clear-AppContainers {
     }
 }
 
+function Clear-Cordova {
+    $cordovaPath = "$env:USERPROFILE\.cordova"
+
+    if (Test-Path $cordovaPath) {
+        Write-Item "✓" "Green" "Cleaning Cordova tmp files..."
+        # Cordova leaves stale npm tarballs/extractions under lib\tmp*
+        $tmpDirs = Get-ChildItem -Path "$cordovaPath\lib" -Filter "tmp*" -Force -ErrorAction SilentlyContinue
+        foreach ($d in $tmpDirs) {
+            Remove-SafelyWithTracking -Path $d.FullName -Description "Cordova tmp: $($d.Name)"
+        }
+    } else {
+        Write-Item "✕" "Yellow" "Cordova not found. Skipping."
+    }
+}
+
 # --- Reclaimable-space estimation ---
 # Read-only: computes the current on-disk size of what each cleanup option
 # would remove, then Show-Menu shows it next to each entry. Categories use
@@ -729,6 +744,14 @@ function Invoke-EstimateAll {
     $b = Get-PathSizeBytes $brPaths
     Set-Estimate "browser" (Format-Size $b); $total += $b
 
+    # Cordova tmp files
+    Write-Host "  Measuring Cordova tmp files..." -ForegroundColor DarkGray
+    $cordovaTmp = @()
+    $cordovaDirs = Get-ChildItem -Path "$env:USERPROFILE\.cordova\lib" -Filter "tmp*" -Force -ErrorAction SilentlyContinue
+    foreach ($t in $cordovaDirs) { $cordovaTmp += $t.FullName }
+    $b = Get-PathSizeBytes $cordovaTmp
+    Set-Estimate "cordova" (Format-Size $b); $total += $b
+
     # App containers
     Write-Host "  Measuring app caches..." -ForegroundColor DarkGray
     $acPaths = @(
@@ -780,16 +803,17 @@ function Show-Menu {
     Write-Host (" 6. Clear npm/Yarn/pnpm Caches" + (Get-Est 'npm')) -ForegroundColor Green
     Write-Host (" 7. Clear NuGet Package Cache" + (Get-Est 'nuget')) -ForegroundColor Green
     Write-Host (" 8. Clear PlatformIO Caches" + (Get-Est 'platformio')) -ForegroundColor Green
+    Write-Host (" 9. Clear Cordova tmp files" + (Get-Est 'cordova')) -ForegroundColor Green
     Write-Host "─── IDEs & Editors ───" -ForegroundColor DarkGray
-    Write-Host (" 9. Clear IDE Caches (JetBrains, VSCode)" + (Get-Est 'ide')) -ForegroundColor Green
+    Write-Host ("10. Clear IDE Caches (JetBrains, VSCode)" + (Get-Est 'ide')) -ForegroundColor Green
     Write-Host "─── System ───" -ForegroundColor DarkGray
-    Write-Host ("10. Clean Windows Temp & Recycle Bin" + (Get-Est 'windowstemp')) -ForegroundColor Green
-    Write-Host ("11. Clear Browser Caches (Chrome, Edge, Firefox, Brave, Opera)" + (Get-Est 'browser')) -ForegroundColor Green
-    Write-Host ("12. Clean App Caches (Slack, Teams, Discord, Spotify, WhatsApp)" + (Get-Est 'appcontainers')) -ForegroundColor Green
+    Write-Host ("11. Clean Windows Temp & Recycle Bin" + (Get-Est 'windowstemp')) -ForegroundColor Green
+    Write-Host ("12. Clear Browser Caches (Chrome, Edge, Firefox, Brave, Opera)" + (Get-Est 'browser')) -ForegroundColor Green
+    Write-Host ("13. Clean App Caches (Slack, Teams, Discord, Spotify, WhatsApp)" + (Get-Est 'appcontainers')) -ForegroundColor Green
     Write-Host ""
     Write-Host "99. Estimate reclaimable space (read-only, ~ = approximate)" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "→ Please enter your choice (0-12, or 99 to estimate): " -NoNewline
+    Write-Host "→ Please enter your choice (0-13, or 99 to estimate): " -NoNewline
 }
 
 # --- Main Loop ---
@@ -816,6 +840,7 @@ function Start-MainLoop {
                 Clear-NpmYarnPnpm
                 Clear-NuGet
                 Clear-PlatformIO
+                Clear-Cordova
                 Clear-IdeCaches
                 Clear-WindowsTemp
                 Clear-BrowserCaches
@@ -878,18 +903,22 @@ function Start-MainLoop {
                 Clear-PlatformIO
             }
             "9" {
+                Write-SectionHeader "Performing Cordova Cleanup"
+                Clear-Cordova
+            }
+            "10" {
                 Write-SectionHeader "Performing IDE Caches Cleanup"
                 Clear-IdeCaches
             }
-            "10" {
+            "11" {
                 Write-SectionHeader "Performing Windows Temp & Recycle Bin Cleanup"
                 Clear-WindowsTemp
             }
-            "11" {
+            "12" {
                 Write-SectionHeader "Performing Browser Caches Cleanup"
                 Clear-BrowserCaches
             }
-            "12" {
+            "13" {
                 Write-SectionHeader "Performing App Caches Cleanup"
                 Clear-AppContainers
             }
@@ -901,7 +930,7 @@ function Start-MainLoop {
                 continue
             }
             default {
-                Write-Host "Invalid choice. Please enter a number between 0 and 12." -ForegroundColor Red
+                Write-Host "Invalid choice. Please enter a number between 0 and 13." -ForegroundColor Red
                 Start-Sleep -Seconds 2
                 continue
             }
