@@ -100,6 +100,22 @@ human_kb() {
     }'
 }
 
+# Convert a Docker size string (Docker uses DECIMAL units: B/kB/MB/GB/TB,
+# e.g. "1.02GB", "728.5MB", "32.8kB", "0B") into KiB so Docker's own
+# self-reported sizes can be summed and fed to human_kb() like every other
+# estimate. Suffix order matters: kB/MB/GB/TB all end in "B", so the bare
+# "B" case must be checked last. Read-only.
+docker_size_to_kb() {
+    awk -v s="${1:-0B}" 'BEGIN {
+        if      (s ~ /TB$/) { sub(/TB$/,"",s); printf "%d", s*1e12/1024 }
+        else if (s ~ /GB$/) { sub(/GB$/,"",s); printf "%d", s*1e9/1024 }
+        else if (s ~ /MB$/) { sub(/MB$/,"",s); printf "%d", s*1e6/1024 }
+        else if (s ~ /kB$/) { sub(/kB$/,"",s); printf "%d", s*1e3/1024 }
+        else if (s ~  /B$/) { sub(/B$/,"",s);  printf "%d", s/1024 }
+        else                { printf "0" }
+    }'
+}
+
 # Sum the disk usage (in KB) of the given paths/globs. Read-only.
 # Glob handling mirrors safe_rm() so the estimate matches what cleanup deletes.
 # Usage: du_kb_sum <path-or-glob> [<path-or-glob> ...]
@@ -621,6 +637,55 @@ cleanup_electron() {
     fi
 }
 
+# Usage: cleanup_docker [interactive]
+#   no arg      -> safe `prune -f` only, no prompt (used by "Clear All Caches"
+#                  so a bulk run never deletes tagged images by surprise)
+#   interactive -> offer the deeper `prune -af` via a secondary prompt
+cleanup_docker() {
+    local mode="${1:-}"
+    if ! command -v docker &> /dev/null; then
+        print_item "✕" "${YELLOW}" "Docker not found. Skipping."
+        return
+    fi
+    # `command -v` only proves the CLI exists; the daemon may still be down.
+    local df_out
+    if ! df_out=$(docker system df 2>/dev/null); then
+        print_item "✕" "${YELLOW}" "Docker daemon not running. Skipping."
+        return
+    fi
+    print_item "✓" "${GREEN}" "Docker disk usage:"
+    echo "$df_out"
+
+    # `prune -f` removes stopped containers, unused networks, dangling
+    # (untagged) images and unused build cache. `-a` additionally removes
+    # EVERY image not used by a container, including tagged ones that may
+    # only exist in a private registry — so it's opt-in via a prompt, never
+    # in the bulk "Clear All" path. (--volumes stays omitted in both: it
+    # would delete named-volume data like databases.)
+    local prune_args="-f"
+    if [ "$mode" = "interactive" ] && ! $DRY_RUN; then
+        echo ""
+        echo -e "${YELLOW}Also remove unused but TAGGED images? Frees more space, but they"
+        echo -e "must be re-pulled/rebuilt (e.g. private-registry images). (y/N):${NC}"
+        local ans
+        read -r ans
+        if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+            prune_args="-af"
+        fi
+    fi
+
+    # Docker has no real --dry-run, so honour the flag manually like
+    # cleanup_android_sdk: prune is destructive (but rebuildable), so just
+    # announce it under --dry-run instead of running. -f skips docker's own
+    # confirmation (the script already confirmed).
+    if $DRY_RUN; then
+        echo -e "${YELLOW}[DRY-RUN] Would run: docker system prune -f${NC}"
+        echo -e "${FAINT}  (option 15 also offers 'docker system prune -af' to remove unused tagged images)${NC}"
+    else
+        docker system prune $prune_args
+    fi
+}
+
 # --- Reclaimable-space estimation ---
 # Read-only feature: computes the current on-disk size of what every cleanup
 # option would remove, then display_menu() shows it next to each entry.
@@ -787,6 +852,56 @@ estimate_all() {
     set_estimate electron "$(human_kb "$kb")"
     total=$((total + kb))
 
+    # Docker is not path-based: ask docker itself (read-only). Two figures,
+    # because option 15 offers two prune modes:
+    #   -f  : build-cache reclaimable + dangling (untagged) images
+    #   -af : the above + ALL images not used by a container (tagged too)
+    # Build-cache reclaimable comes from the `system df` summary (Docker
+    # computes it correctly; only its Images figure is unreliable with the
+    # containerd image store). Per-image sizes come from `system df -v`,
+    # summing UNIQUE SIZE of 0-container rows so shared layers aren't double
+    # counted. Approximate, so not added to the byte total.
+    print_item "•" "${FAINT}" "Measuring Docker reclaimable space..."
+    local df_fmt
+    if command -v docker &> /dev/null \
+        && df_fmt=$(docker system df --format '{{.Type}}|{{.Reclaimable}}' 2>/dev/null) \
+        && [ -n "$df_fmt" ]; then
+        local cache_tok cache_kb dangling_kb allunused_kb f_kb af_kb
+        cache_tok=$(echo "$df_fmt" | awk -F'|' '$1=="Build Cache"{sub(/ *\(.*/,"",$2);print $2}')
+        cache_kb=$(docker_size_to_kb "${cache_tok:-0B}")
+        # Parse the "Images space usage:" table. CREATED is multi-word
+        # ("4 days ago"), so index fields from the RIGHT: $NF=CONTAINERS,
+        # $(NF-1)=UNIQUE SIZE. d=dangling 0-container, a=all 0-container.
+        read -r dangling_kb allunused_kb < <(docker system df -v 2>/dev/null | awk '
+            function tokb(s) {
+                if      (s ~ /TB$/) { sub(/TB$/,"",s); return s*1e12/1024 }
+                else if (s ~ /GB$/) { sub(/GB$/,"",s); return s*1e9/1024 }
+                else if (s ~ /MB$/) { sub(/MB$/,"",s); return s*1e6/1024 }
+                else if (s ~ /kB$/) { sub(/kB$/,"",s); return s*1e3/1024 }
+                else if (s ~  /B$/) { sub(/B$/,"",s);  return s/1024 }
+                return 0
+            }
+            /^Images space usage:/ { in_img=1; next }
+            in_img && /^REPOSITORY/ { hdr=1; next }
+            in_img && hdr {
+                if (NF==0) { in_img=0; hdr=0; next }
+                if ($NF==0) { a += tokb($(NF-1)); if ($1=="<none>") d += tokb($(NF-1)) }
+                next
+            }
+            END { printf "%d %d\n", d+0, a+0 }')
+        f_kb=$(( cache_kb + ${dangling_kb:-0} ))
+        af_kb=$(( cache_kb + ${allunused_kb:-0} ))
+        if [ "$af_kb" -gt "$f_kb" ]; then
+            set_estimate docker "~$(human_kb "$f_kb") → ~$(human_kb "$af_kb") with -a"
+        else
+            set_estimate docker "~$(human_kb "$f_kb")"
+        fi
+    elif command -v docker &> /dev/null; then
+        set_estimate docker "n/a (daemon not running)"
+    else
+        set_estimate docker "n/a (docker not found)"
+    fi
+
     print_item "•" "${FAINT}" "Measuring app container caches..."
     kb=$(du_kb_sum \
         "$HOME/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Caches"/* \
@@ -836,12 +951,13 @@ display_menu() {
     echo -e "${GREEN}12.${NC} Clean Android SDK (old build-tools, x86 images)$(est android_sdk)"
     echo -e "${GREEN}13.${NC} Clear Cordova tmp files$(est cordova)"
     echo -e "${GREEN}14.${NC} Clear Electron cache$(est electron)"
-    echo -e "${GREEN}15.${NC} Clean App Containers (Slack, Teams, Discord, Spotify, WhatsApp)$(est appcontainers)"
-    echo -e "${GREEN}16.${NC} Remove Time Machine Local Snapshots (requires sudo)$(est timemachine)"
+    echo -e "${GREEN}15.${NC} Clear Docker (prune containers, dangling images & build cache; asks before removing unused tagged images)$(est docker)"
+    echo -e "${GREEN}16.${NC} Clean App Containers (Slack, Teams, Discord, Spotify, WhatsApp)$(est appcontainers)"
+    echo -e "${GREEN}17.${NC} Remove Time Machine Local Snapshots (requires sudo)$(est timemachine)"
     echo ""
     echo -e "${CYAN}99.${NC} Estimate reclaimable space ${FAINT}(read-only, ~ = approximate)${NC}"
     echo ""
-    echo -e "→ Please enter your choice (0-16, or 99 to estimate): ${NC}\c"
+    echo -e "→ Please enter your choice (0-17, or 99 to estimate): ${NC}\c"
 }
 
 # --- Help function ---
@@ -916,6 +1032,7 @@ main_loop() {
                 cleanup_browser_caches
                 cleanup_cordova
                 cleanup_electron
+                cleanup_docker
                 cleanup_app_containers
                 cleanup_timemachine_snapshots
                 ;;
@@ -1013,10 +1130,14 @@ main_loop() {
                 cleanup_electron
                 ;;
             15)
+                print_section_header "Performing Docker Cleanup"
+                cleanup_docker interactive
+                ;;
+            16)
                 print_section_header "Performing App Containers Cleanup"
                 cleanup_app_containers
                 ;;
-            16)
+            17)
                 print_section_header "Performing Time Machine Snapshots Cleanup"
                 cleanup_timemachine_snapshots
                 ;;
@@ -1028,7 +1149,7 @@ main_loop() {
                 continue
                 ;;
             *)
-                echo -e "${RED}Invalid choice. Please enter a number between 0 and 16.${NC}"
+                echo -e "${RED}Invalid choice. Please enter a number between 0 and 17.${NC}"
                 sleep 2
                 ;;
         esac
